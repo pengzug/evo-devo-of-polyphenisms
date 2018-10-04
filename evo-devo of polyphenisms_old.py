@@ -74,7 +74,7 @@ def environ_variation(t):
 # returns value of environmental cue at generation t
 def environ_cue(t):
     hurz = environ_variation(t)
-    P = 1 # environmental predictability
+    P = 0.9 # environmental predictability
     #mu = P * hurz # for [-1, 1] range of E and C
     mu = 0.5 * (1 - P) + P * hurz # for [0, 1] range of E and C
     #sigma = (1 - P) / 3 # for [-1, 1] range of E and C
