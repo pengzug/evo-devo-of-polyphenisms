@@ -11,31 +11,54 @@
 #####################################################
 """
 
+import sys
 import pprint
+import contextlib
+import multiprocessing
+import concurrent.futures
 
+import toml
 import numpy as np
 from scipy import optimize
 import tqdm
 import click
 from loguru import logger
 
+logger.remove()
+
+config = dict(
+    n=500,  # Population size
+    num_gen=1000,  # Number of generations
+    A=1,  # Scaling constant for deterministic environmental actors
+    B=0,  # Scaling constant for stochastic environmental factors
+    L=1,  # Number of time steps per generation (life span)
+
+    # Relative time scale of environmental variation
+    # (number of generations per environmental cycle)
+    R=500,
+
+    P=0.9,  # Environmental predictability
+    tau=1,  # Strength of fitness decay due to phenotypic mismatch
+    phi=4,  # Strength of fitness gain due to advantage of rare/extreme phenotypes
+    kd=0.01,  # Cost for developmental plasticity
+    mu=0.001  # Mutation rate
+)
+
 
 def environment(t):
     """sets environmental variation and calculates corresponding cue"""
-
     # E: environmental condition (e.g. temperature)
-    eps = 1 - np.random.random() # stochastic error term
-    E = A * (np.sin(2 * np.pi * t / (L * R)) + 1) / 2 + B * eps
+    eps = 1 - np.random.random()  # stochastic error term
+    E = (
+        config['A'] * (np.sin(2 * np.pi * t / (config['L'] * config['R'])) + 1)
+        / 2 + config['B'] * eps
+    )
 
     # C: environmental cue (e.g. photoperiod)
-    mu_env = 0.5 * (1 - P) + P * E
-    sigma_env = 0.5 * (1 - P) / 3
-    C = np.random.normal(mu_env, sigma_env)
-    if C <= 0.0:
-        C = 1e-09
-    if C <= 0.0:
-        raise ValueError("C is lower than or equal to zero.")
-
+    mu_env = 0.5 * (1 - config['P']) + config['P'] * E
+    sigma_env = 0.5 * (1 - config['P']) / 3
+    C = max(1e-9, np.random.normal(mu_env, sigma_env))
+    assert C > 0
     return E, C
 
 
@@ -46,11 +69,13 @@ def create_population(n):
     # G: genetic component of basal expression of x
     # b: degree to which basal expression of x depends on environment
     # basal: basal expression of the lineage factor x (basal = G + b*C)
-    # alpha: strength of the feedback (in the ODE); initial value: nicht mehr 1e-09, sondern 1
+    # alpha: strength of the feedback (in the ODE); initial value: 1
     # hill: Hill coefficient (in the ODE); initial value: 1
-    population = np.zeros(n, dtype=[('E','<f8'), ('C','<f8'), ('G','<f8'), ('b', '<f8'), 
-                                    ('basal','<f8'), ('alpha','<f8'), ('hill','<f8'), 
-                                    ('phenotype','<f8'), ('fitness','<f8')])
+    population = np.zeros(n, dtype=[
+        ('E', '<f8'), ('C', '<f8'), ('G', '<f8'), ('b', '<f8'),
+        ('basal', '<f8'), ('alpha', '<f8'), ('hill', '<f8'),
+        ('phenotype', '<f8'), ('fitness', '<f8')
+    ])
     population['G'] = 1 - np.random.random(n)
     population['b'] = 1 - np.random.random(n)
     population['alpha'] = 1
@@ -58,8 +83,63 @@ def create_population(n):
     return population
 
 
-# phenotype function with scipy.optimize.root
-def phenotype(population):
+def find_roots(fun, limits, args=None):
+    if args is None:
+        args = tuple()
+
+    search_space = np.logspace(np.log10(limits[0]), np.log10(limits[1]), 100)
+    val = fun(search_space, *args)
+    sign_changes = np.sign(val[1:]) != np.sign(val[:-1])
+
+    brackets = zip(
+        search_space[:-1][sign_changes],
+        search_space[1:][sign_changes]
+    )
+    roots = []
+
+    for bracket in brackets:
+        # polish initial brackets to convergence
+        res = optimize.root_scalar(
+            fun,
+            bracket=bracket,
+            args=args,
+            method='brentq',
+        )
+
+        if not res.converged:
+            logger.warning('root solver did not converge; flag: {}', res.flag)
+        else:
+            roots.append(res.root)
+
+    return roots
+
+
+def phenotype_ode(x, population):
+    dxdt = (population['basal'] - x + population['alpha']
+            * (x ** population['hill'] / (1 + x ** population['hill'])))
+    return dxdt
+
+
+def _root_solve_iter(coeffs):
+    limits = (coeffs['basal'], coeffs['basal'] + coeffs['alpha'])
+    return min(find_roots(phenotype_ode, limits, args=(coeffs,)))
+
+
+def root_solver(population, executor=None):
+    """Solve for lower steady state of ODE.
+
+    This solver exploits that ODE has 1 or 3 distinct roots in the interval
+    (basal, basal + alpha).
+    """
+    if executor is None:
+        res_iter = map(_root_solve_iter, population)
+    else:
+        res_iter = executor.map(_root_solve_iter, population, chunksize=100)
+
+    return np.fromiter(res_iter, dtype='float')
+
+
+def phenotype(population, executor=None):
     """creates the phenotype"""
 
     population['basal'] = population['G'] + population['b'] * population['C']
@@ -70,133 +150,82 @@ def phenotype(population):
     if np.any(population['alpha'] <= 0):
         raise ValueError("population['alpha'] is lower than or equal to zero before mutation.")
 
-    def fun(x):
-        x = np.maximum(1e-8, x)
-        return (population['basal'] - x + population['alpha'] 
-                * (x ** population['hill'] / (1 + x ** population['hill'])))
-    
-    sol = optimize.root(fun, np.zeros(n), method='excitingmixing', options=dict(fatol=1e-8))
-    return sol.x
+    return root_solver(population, executor=executor)
 
 
 def fitness(population):
     """calculates the fitness"""
-    
     mean_phenotype = np.mean(population['phenotype'])
     # fitness_part_1: fitness component deriving from phenotypic (mis)match
-    fitness_part_1 = (np.exp(-np.abs(population['E'] - population['phenotype']) * tau))
+    fitness_part_1 = (np.exp(-np.abs(population['E'] - population['phenotype']) * config['tau']))
     # fitness_part_2: fitness component deriving from disruptive selection (advantage of rare phenotypes)
-    fitness_part_2 = (1 - np.exp(-np.abs(mean_phenotype - population['phenotype']) * phi))
-    W = (fitness_part_1 * fitness_part_2) - kd
-    W[np.flatnonzero(W < 0.0)] = 0.0
+    fitness_part_2 = (1 - np.exp(-np.abs(mean_phenotype - population['phenotype']) * config['phi']))
+    W = (fitness_part_1 * fitness_part_2) - config['kd']
+    W[W < 0.] = 0.
     return W
 
 
 def mutation(population):
     """introduces random mutations for the genetic parameters"""
-    
     n = len(population)
-    
-    # mutation of G; 1e-09 <= G <= 1
-    indices_muta_G, = np.where(np.random.random(n) <= mu) # comma is important!
-    number_muta_G = indices_muta_G.size
-    population['G'][indices_muta_G] += np.random.normal(0, 0.05, number_muta_G)
-    # lower bound: 1e-09
-    non_pos_indices_G, = np.where(population['G'] <= 0.0) # comma is important!
-    population['G'][non_pos_indices_G] = 1e-09
-    # upper bound: 1
-    population['G'][np.flatnonzero(population['G'] > 1)] = 1
-    if np.any(population['G'] <= 0):
-        raise ValueError("population['G'] is lower than or equal to zero.")
-        
-    # mutation of b; 1e-09 <= b <= 1
-    indices_muta_b, = np.where(np.random.random(n) <= mu)
-    number_muta_b = indices_muta_b.size
-    population['b'][indices_muta_b] += np.random.normal(0, 0.05, number_muta_b)
-    # lower bound: 1e-09
-    non_pos_indices_b, = np.where(population['b'] <= 0.0)
-    population['b'][non_pos_indices_b] = 1e-09
-    # upper bound: 1
-    population['b'][np.flatnonzero(population['b'] > 1)] = 1
-    if np.any(population['b'] <= 0):
-        raise ValueError("population['b'] is lower than or equal to zero.")
-    
-    # mutation of alpha; lower bound either 1e-09 or 1
-    indices_muta_alpha, = np.where(np.random.random(n) <= mu)
-    number_muta_alpha = indices_muta_alpha.size
-    population['alpha'][indices_muta_alpha] += np.random.normal(0, 0.05, number_muta_alpha)
-    # lower bound: 1e-09
-    #non_pos_indices_alpha, = np.where(population['alpha'] <= 0.0)
-    #population['alpha'][non_pos_indices_alpha] = 1e-09
-    # lower bound: 1
-    population['alpha'][np.flatnonzero(population['alpha'] < 1)] = 1
-    if np.any(population['alpha'] <= 0):
-        raise ValueError("population['alpha'] is lower than or equal to zero after mutation.")
-    
-    # mutation of hill; lower bound either 1e-09 or 1
-    indices_muta_hill, = np.where(np.random.random(n) <= mu)
-    number_muta_hill = indices_muta_hill.size
-    population['hill'][indices_muta_hill] += np.random.normal(0, 0.05, number_muta_hill)
-    # lower bound: 1e-09
-    #non_pos_indices_hill, = np.where(population['hill'] <= 0.0)
-    #population['hill'][non_pos_indices_hill] = 1e-09
-    # lower bound: 1
-    population['hill'][np.flatnonzero(population['hill'] < 1)] = 1
-    if np.any(population['hill'] <= 0):
-        raise ValueError("population['hill'] is lower than or equal to zero.")
+
+    mutation_coeffs = (
+        # key, perturbation, lower bound, upper bound
+        ('G', 0.05, 1e-9, 1),
+        ('b', 0.05, 1e-9, 1),
+        ('alpha', 0.05, 1, None),
+        ('hill', 0.05, 1, None),
+    )
+
+    for key, perturbation, lower, upper in mutation_coeffs:
+        mutation = np.where(
+            np.random.random(n) <= config['mu'],
+            np.random.normal(0, 0.05, n),
+            0
+        )
+
+        population[key] = np.clip(
+            population[key] + mutation,
+            lower, upper
+        )
 
 
-def reproduction(population):
+def reproduction(population, executor=None):
     """produces next generation via mutation and natural selection"""
-    
     mutation(population)
-    population['phenotype'] = phenotype(population)
+    population['phenotype'] = phenotype(population, executor=executor)
     if np.any(population['phenotype'] < 0):
         raise ValueError("population['phenotype'] is lower than zero.")
-    
+
     population['fitness'] = fitness(population)
     if np.any(population['fitness'] < 0):
         raise ValueError("population['fitness'] is negative.")
-    
+
     mean_fitness_before = np.mean(population['fitness'])
-    #print(f"Mean fitness before selection round {t}:", mean_fitness_before)
     if (mean_fitness_before == 0):
-        raise RuntimeError("Mean fitness of population decreased to 0.")
-    else:
-        offspring = np.random.poisson(population['fitness'] / mean_fitness_before)
-    #print("Pop before reproduction: \n", population)
+        raise ValueError("Mean fitness of population decreased to 0.")
+    offspring = np.random.poisson(population['fitness'] / mean_fitness_before)
+
+    logger.debug("Pop before reproduction: \n{}", population)
+
     population = np.repeat(population, offspring)
-    if len(population) > n:
-        population = np.random.choice(population, n, replace=False)
-    elif len(population) < n:
-        clones = np.random.choice(np.arange(len(population)), n-len(population), 
+    if len(population) > config['n']:
+        population = np.random.choice(population, config['n'], replace=False)
+    elif len(population) < config['n']:
+        clones = np.random.choice(np.arange(len(population)),
+                                  config['n'] - len(population),
                                   replace=False)
         clone_rep = np.ones(len(population), dtype=np.int)
         clone_rep[clones] = 2
         population = np.repeat(population, clone_rep)
+
     return population
 
 
-def main(n=500, num_gens=1000, a=1, b=0, l=1, r=500,
-         p=0.9, tau=1, phi=4, kd=0.01, mu=0.001):
-    logger.add(
-        sys.stdout, colorize=True,
-        format="<green>{time}</green> <level>{message}</level>"
-    )
+def main(nproc=1):
+    logger.info("Configuration:\n{}\n", pprint.pformat(config))
 
-    logger.info("Population size: {}", n)
-    logger.info("Generations: {}", num_gens)
-    logger.info("A: {}", a)
-    logger.info("B: {}", b)
-    logger.info("L: {}", l)
-    logger.info("log R: {}", np.log10(r))
-    logger.info("P: {}", p)
-    logger.info("tau: {}", tau)
-    logger.info("phi: {}", phi)
-    logger.info("kd: {}", kd)
-    logger.info("mu: {}", mu)
-
-    population = create_population(n)
+    population = create_population(config['n'])
 
     list_environment = []
     list_C = []
@@ -204,107 +233,72 @@ def main(n=500, num_gens=1000, a=1, b=0, l=1, r=500,
     list_mean_b = []
     list_mean_phenotype = []
 
-    for t in tqdm.tqdm(range(1, no_gens + 1)):
-        enviro = environment(t)
-        population['E'] = enviro[0]
-        population['C'] = enviro[1]
-        population = reproduction(population)
+    with contextlib.ExitStack() as es:
+        if nproc > 1:
+            executor = es.enter_context(
+                concurrent.futures.ProcessPoolExecutor(nproc)
+            )
+        else:
+            executor = None
 
-        # Environment
-        mean_environment = np.mean(population['E'])
-        list_environment.append(mean_environment)
+        for t in tqdm.tqdm(range(1, config['num_gen'] + 1)):
+            population['E'], population['C'] = environment(t)
+            population = reproduction(population, executor=executor)
 
-        mean_C = np.mean(population['C'])
-        list_C.append(mean_C)
+            # Environment
+            mean_environment = np.mean(population['E'])
+            list_environment.append(mean_environment)
 
-        mean_fitness_after = np.mean(population['fitness'])
-        list_mean_fitness.append(mean_fitness_after)
+            mean_C = np.mean(population['C'])
+            list_C.append(mean_C)
 
-        # Population mean of b
-        mean_b = np.mean(population['b'])
-        list_mean_b.append(mean_b)
+            mean_fitness_after = np.mean(population['fitness'])
+            list_mean_fitness.append(mean_fitness_after)
 
-        # Population mean of phenotype
-        mean_phenotype = np.mean(population['phenotype'])
-        list_mean_phenotype.append(mean_phenotype)
+            # Population mean of b
+            mean_b = np.mean(population['b'])
+            list_mean_b.append(mean_b)
+
+            # Population mean of phenotype
+            mean_phenotype = np.mean(population['phenotype'])
+            list_mean_phenotype.append(mean_phenotype)
 
     # OUTPUT
     for var in ('C', 'G', 'b', 'alpha', 'hill', 'phenotype', 'fitness'):
-        values, counts = np.unique(population[var], return_counts=True)
-        if np.sum(counts) != n:
-            raise ValueError("The number of C values does not equal n.")
-        table = np.zeros(
-            len(values),
-            dtype=[(f'{var} values', '<f8'), (f'{var} counts', '<i8')]
-        )
-        table[f'{var} values'] = values
-        table[f'{var} counts'] = counts
-        formatted_table = pprint.pformat(table)
-        logger.info(f"{var} table: {formatted_table}")
+        counts, bin_edges = np.histogram(population[var], bins=10)
+        assert np.sum(counts) == config['n']
+        bins = 0.5 * (bin_edges[1:] + bin_edges[:-1])
+        bar_width = (80 * counts / config['n']).astype(np.int)
+
+        hist_parts = ['', var, '#' * len(var)]
+        for bin_center, bin_value, count in zip(bins, bar_width, counts):
+            hist_parts.append(
+                f'{bin_center:.2e} | {"█" * bin_value:<80} | ({count})'
+            )
+        hist_parts.append('')
+
+        logger.info('\n'.join(hist_parts))
 
     return population
 
-    """
-    # advanced plotting
-    space = np.linspace(0, 1, 100)
-    phenotype_container = []
-    for C in space:
-        population['basal'] = population['G'] + population['b'] * C#population['C']
-        def fun(x):
-            x = np.maximum(1e-8, x)
-            return (population['basal'] - x + population['alpha']
-                    * (x ** population['hill'] / (1 + x ** population['hill'])))
-        sol = optimize.root(fun, np.zeros(n), method='excitingmixing', options=dict(fatol=1e-8))
-        phenotype_plot = sol.x
-        phenotype_container.append(phenotype_plot)
-    plt.plot(space, phenotype_container, color='k', linewidth=0.1)
-    plt.ylim(-0.05, 2.55)
-    """
-
-    """
-    # plotting
-    plt.plot(list_environment, label='environment')
-    plt.ylim(-0.05, 1.05)
-
-    plt.plot(list_C, label='C')
-    plt.ylim(-0.05, 1.05)
-
-    plt.plot(list_mean_fitness, label='fitness')
-    plt.ylim(-0.05, 1.05)
-
-    plt.plot(list_mean_b, label='b')
-    plt.ylim(-0.05, 1.05)
-
-    plt.plot(list_mean_phenotype, label='phenotype')
-    plt.ylim(-0.05, 1.05)
-
-    plt.legend()
-    """
-
 
 @click.command()
-@click.option('-n', help='Population size', default=500, type=int)
-@click.option('-N', '--num-gens', help='Numer of generations', default=1000, type=int)
-@click.option('-a', help='Scaling constant for deterministic environmental actors',
-              default=1, type=float)
-@click.option('-b', help='Scaling constant for stochastic environmental factors',
-              default=0, type=float)
-@click.option('-l', help='Number of time steps per generation (life span)',
-              default=1, type=int)
-@click.option('-r', help=(
-    'Relative time scale of environmental variation '
-    '(number of generations per environmental cycle)'
-), default=500, type=float)
-@click.option('-p', help='Environmental predictability', default=0.9, type=float)
-@click.option('--tau', help='Strength of fitness decay due to phenotypic mismatch',
-              default=1, type=float)
-@click.option('--phi', help='Strength of fitness gain due to advantage of rare/extreme phenotypes',
-              default=4, type=float)
-@click.option('--kd', help='Cost for developmental plasticity',
-              default=0.01, type=float)
-@click.option('--mu', help='Mutation rate', default=0.001, type=float)
-def cli(**kwargs):
-    return main(**kwargs)
+@click.option('-c', '--config', type=click.File('r'), default=None,
+              help='Path to config file in TOML format')
+@click.option('--nproc', help='Number of parallel processes for phenotype solver',
+              default=multiprocessing.cpu_count(), type=int)
+@click.option('--loglevel', default='info')
+def cli(config, nproc, loglevel):
+    logger.add(
+        sys.stdout, colorize=sys.stdout.isatty(),
+        format="<green>{time:%H:%M:%S}</green> <level>{message}</level>",
+        level=loglevel.upper()
+    )
+
+    if config is not None:
+        config.update(toml.load(config))
+
+    return main(nproc=nproc)
 
 
 if __name__ == '__main__':
