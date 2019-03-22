@@ -26,7 +26,7 @@ from loguru import logger
 
 logger.remove()
 
-config = dict(
+CONFIG = dict(
     n=500,  # Population size
     num_gen=1000,  # Number of generations
     A=1,  # Scaling constant for deterministic environmental actors
@@ -50,13 +50,13 @@ def environment(t):
     # E: environmental condition (e.g. temperature)
     eps = 1 - np.random.random()  # stochastic error term
     E = (
-        config['A'] * (np.sin(2 * np.pi * t / (config['L'] * config['R'])) + 1)
-        / 2 + config['B'] * eps
+        CONFIG['A'] * (np.sin(2 * np.pi * t / (CONFIG['L'] * CONFIG['R'])) + 1)
+        / 2 + CONFIG['B'] * eps
     )
 
     # C: environmental cue (e.g. photoperiod)
-    mu_env = 0.5 * (1 - config['P']) + config['P'] * E
-    sigma_env = 0.5 * (1 - config['P']) / 3
+    mu_env = 0.5 * (1 - CONFIG['P']) + CONFIG['P'] * E
+    sigma_env = 0.5 * (1 - CONFIG['P']) / 3
     C = max(1e-9, np.random.normal(mu_env, sigma_env))
     assert C > 0
     return E, C
@@ -157,10 +157,10 @@ def fitness(population):
     """calculates the fitness"""
     mean_phenotype = np.mean(population['phenotype'])
     # fitness_part_1: fitness component deriving from phenotypic (mis)match
-    fitness_part_1 = (np.exp(-np.abs(population['E'] - population['phenotype']) * config['tau']))
+    fitness_part_1 = (np.exp(-np.abs(population['E'] - population['phenotype']) * CONFIG['tau']))
     # fitness_part_2: fitness component deriving from disruptive selection (advantage of rare phenotypes)
-    fitness_part_2 = (1 - np.exp(-np.abs(mean_phenotype - population['phenotype']) * config['phi']))
-    W = (fitness_part_1 * fitness_part_2) - config['kd']
+    fitness_part_2 = (1 - np.exp(-np.abs(mean_phenotype - population['phenotype']) * CONFIG['phi']))
+    W = (fitness_part_1 * fitness_part_2) - CONFIG['kd']
     W[W < 0.] = 0.
     return W
 
@@ -179,7 +179,7 @@ def mutation(population):
 
     for key, perturbation, lower, upper in mutation_coeffs:
         mutation = np.where(
-            np.random.random(n) <= config['mu'],
+            np.random.random(n) <= CONFIG['mu'],
             np.random.normal(0, 0.05, n),
             0
         )
@@ -209,11 +209,11 @@ def reproduction(population, executor=None):
     logger.debug("Pop before reproduction: \n{}", population)
 
     population = np.repeat(population, offspring)
-    if len(population) > config['n']:
-        population = np.random.choice(population, config['n'], replace=False)
-    elif len(population) < config['n']:
+    if len(population) > CONFIG['n']:
+        population = np.random.choice(population, CONFIG['n'], replace=False)
+    elif len(population) < CONFIG['n']:
         clones = np.random.choice(np.arange(len(population)),
-                                  config['n'] - len(population),
+                                  CONFIG['n'] - len(population),
                                   replace=False)
         clone_rep = np.ones(len(population), dtype=np.int)
         clone_rep[clones] = 2
@@ -223,15 +223,9 @@ def reproduction(population, executor=None):
 
 
 def main(nproc=1):
-    logger.info("Configuration:\n{}\n", pprint.pformat(config))
+    logger.info("Configuration:\n{}\n", pprint.pformat(CONFIG))
 
-    population = create_population(config['n'])
-
-    list_environment = []
-    list_C = []
-    list_mean_fitness = []
-    list_mean_b = []
-    list_mean_phenotype = []
+    population = create_population(CONFIG['n'])
 
     with contextlib.ExitStack() as es:
         if nproc > 1:
@@ -241,34 +235,16 @@ def main(nproc=1):
         else:
             executor = None
 
-        for t in tqdm.tqdm(range(1, config['num_gen'] + 1)):
+        for t in tqdm.tqdm(range(1, CONFIG['num_gen'] + 1)):
             population['E'], population['C'] = environment(t)
             population = reproduction(population, executor=executor)
-
-            # Environment
-            mean_environment = np.mean(population['E'])
-            list_environment.append(mean_environment)
-
-            mean_C = np.mean(population['C'])
-            list_C.append(mean_C)
-
-            mean_fitness_after = np.mean(population['fitness'])
-            list_mean_fitness.append(mean_fitness_after)
-
-            # Population mean of b
-            mean_b = np.mean(population['b'])
-            list_mean_b.append(mean_b)
-
-            # Population mean of phenotype
-            mean_phenotype = np.mean(population['phenotype'])
-            list_mean_phenotype.append(mean_phenotype)
 
     # OUTPUT
     for var in ('C', 'G', 'b', 'alpha', 'hill', 'phenotype', 'fitness'):
         counts, bin_edges = np.histogram(population[var], bins=10)
-        assert np.sum(counts) == config['n']
+        assert np.sum(counts) == CONFIG['n']
         bins = 0.5 * (bin_edges[1:] + bin_edges[:-1])
-        bar_width = (80 * counts / config['n']).astype(np.int)
+        bar_width = (80 * counts / CONFIG['n']).astype(np.int)
 
         hist_parts = ['', var, '#' * len(var)]
         for bin_center, bin_value, count in zip(bins, bar_width, counts):
@@ -284,11 +260,13 @@ def main(nproc=1):
 
 @click.command()
 @click.option('-c', '--config', type=click.File('r'), default=None,
-              help='Path to config file in TOML format')
+              help='Path to CONFIG file in TOML format')
 @click.option('--nproc', help='Number of parallel processes for phenotype solver',
               default=multiprocessing.cpu_count(), type=int)
 @click.option('--loglevel', default='info')
-def cli(config, nproc, loglevel):
+@click.option('-s', '--set-config', help='Overwrite configuration',
+              multiple=True, nargs=2)
+def cli(config, nproc, loglevel, set_config):
     logger.add(
         sys.stdout, colorize=sys.stdout.isatty(),
         format="<green>{time:%H:%M:%S}</green> <level>{message}</level>",
@@ -296,7 +274,13 @@ def cli(config, nproc, loglevel):
     )
 
     if config is not None:
-        config.update(toml.load(config))
+        CONFIG.update(toml.load(config))
+
+    for key, val in set_config:
+        if key not in CONFIG:
+            raise click.UsageError(f'Unrecognized config key {key}')
+        val_type = type(CONFIG[key])
+        CONFIG[key] = val_type(val)
 
     return main(nproc=nproc)
 
