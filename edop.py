@@ -142,8 +142,6 @@ def root_solver(population, executor=None):
 def phenotype(population, executor=None):
     """creates the phenotype"""
 
-    population['basal'] = population['G'] + population['b'] * population['C']
-
     if np.any(population['basal'] <= 0):
         raise ValueError("population['basal'] is lower than or equal to zero.")
 
@@ -193,6 +191,7 @@ def mutation(population):
 def reproduction(population, executor=None):
     """produces next generation via mutation and natural selection"""
     mutation(population)
+    population['basal'] = population['G'] + population['b'] * population['C']
     population['phenotype'] = phenotype(population, executor=executor)
     if np.any(population['phenotype'] < 0):
         raise ValueError("population['phenotype'] is lower than zero.")
@@ -266,7 +265,9 @@ def main(nproc=1):
 @click.option('--loglevel', default='info')
 @click.option('-s', '--set-config', help='Overwrite configuration',
               multiple=True, nargs=2)
-def cli(config, nproc, loglevel, set_config):
+@click.option('-o', '--output', help='File to write final population to',
+              type=click.Path(dir_okay=False, file_okay=False), default=None)
+def cli(config, nproc, loglevel, set_config, output):
     logger.add(
         sys.stdout, colorize=sys.stdout.isatty(),
         format="<green>{time:%H:%M:%S}</green> <level>{message}</level>",
@@ -282,7 +283,10 @@ def cli(config, nproc, loglevel, set_config):
         val_type = type(CONFIG[key])
         CONFIG[key] = val_type(val)
 
-    return main(nproc=nproc)
+    final_population = main(nproc=nproc)
+
+    if output is not None:
+        np.save(output, final_population)
 
 
 if __name__ == '__main__':
