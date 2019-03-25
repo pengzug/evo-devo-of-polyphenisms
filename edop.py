@@ -178,7 +178,8 @@ def mutation(population):
     for key, perturbation, lower, upper in mutation_coeffs:
         mutation = np.where(
             np.random.random(n) <= CONFIG['mu'],
-            np.random.normal(0, 0.05, n),
+            #np.random.normal(0, 0.05, n),
+            np.random.uniform(-np.sqrt(12)/40, np.sqrt(12)/40, n), # corresponds to mean = 0, SD = 0.05
             0
         )
 
