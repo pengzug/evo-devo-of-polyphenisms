@@ -168,18 +168,17 @@ def mutation(population):
     n = len(population)
 
     mutation_coeffs = (
-        # key, perturbation, lower bound, upper bound
+        # key, standard deviation, lower bound, upper bound
         ('G', 0.05, 1e-9, 1),
         ('b', 0.05, 1e-9, 1),
         ('alpha', 0.05, 1, None),
         ('hill', 0.05, 1, None),
     )
 
-    for key, perturbation, lower, upper in mutation_coeffs:
+    for key, stdev, lower, upper in mutation_coeffs:
         mutation = np.where(
             np.random.random(n) <= CONFIG['mu'],
-            #np.random.normal(0, 0.05, n),
-            np.random.uniform(-np.sqrt(12)/40, np.sqrt(12)/40, n), # corresponds to mean = 0, SD = 0.05
+            np.random.uniform(-np.sqrt(12) / stdev, np.sqrt(12) / stdev, n),
             0
         )
 
